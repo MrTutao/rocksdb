@@ -78,7 +78,9 @@ class CompactionJob {
                 const std::string& dbname,
                 CompactionJobStats* compaction_job_stats,
                 Env::Priority thread_pri,
-                const std::atomic<bool>* manual_compaction_paused = nullptr);
+                const std::atomic<bool>* manual_compaction_paused = nullptr,
+                const std::string& db_id = "",
+                const std::string& db_session_id = "");
 
   ~CompactionJob();
 
@@ -99,6 +101,9 @@ class CompactionJob {
   // REQUIRED: mutex held
   // Add compaction input/output to the current version
   Status Install(const MutableCFOptions& mutable_cf_options);
+
+  // Return the IO status
+  IOStatus io_status() const { return io_status_; }
 
  private:
   struct SubcompactionState;
@@ -149,6 +154,8 @@ class CompactionJob {
 
   // DBImpl state
   const std::string& dbname_;
+  const std::string db_id_;
+  const std::string db_session_id_;
   const ImmutableDBOptions& db_options_;
   const FileOptions file_options_;
 
@@ -193,6 +200,7 @@ class CompactionJob {
   std::vector<uint64_t> sizes_;
   Env::WriteLifeTimeHint write_hint_;
   Env::Priority thread_pri_;
+  IOStatus io_status_;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

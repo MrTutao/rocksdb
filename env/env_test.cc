@@ -35,6 +35,8 @@
 #include "port/malloc.h"
 #include "port/port.h"
 #include "rocksdb/env.h"
+#include "test_util/fault_injection_test_env.h"
+#include "test_util/fault_injection_test_fs.h"
 #include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
@@ -200,6 +202,79 @@ TEST_F(EnvPosixTest, DISABLED_FilePermission) {
     }
   }
 }
+
+TEST_F(EnvPosixTest, LowerThreadPoolCpuPriority) {
+  std::atomic<CpuPriority> from_priority(CpuPriority::kNormal);
+  std::atomic<CpuPriority> to_priority(CpuPriority::kNormal);
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "ThreadPoolImpl::BGThread::BeforeSetCpuPriority", [&](void* pri) {
+        from_priority.store(*reinterpret_cast<CpuPriority*>(pri));
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->SetCallBack(
+      "ThreadPoolImpl::BGThread::AfterSetCpuPriority", [&](void* pri) {
+        to_priority.store(*reinterpret_cast<CpuPriority*>(pri));
+      });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  env_->SetBackgroundThreads(1, Env::BOTTOM);
+  env_->SetBackgroundThreads(1, Env::HIGH);
+
+  auto RunTask = [&](Env::Priority pool) {
+    std::atomic<bool> called(false);
+    env_->Schedule(&SetBool, &called, pool);
+    for (int i = 0; i < kDelayMicros; i++) {
+      if (called.load()) {
+        break;
+      }
+      Env::Default()->SleepForMicroseconds(1);
+    }
+    ASSERT_TRUE(called.load());
+  };
+
+  {
+    // Same priority, no-op.
+    env_->LowerThreadPoolCPUPriority(Env::Priority::BOTTOM,
+                                     CpuPriority::kNormal);
+    RunTask(Env::Priority::BOTTOM);
+    ASSERT_EQ(from_priority, CpuPriority::kNormal);
+    ASSERT_EQ(to_priority, CpuPriority::kNormal);
+  }
+
+  {
+    // Higher priority, no-op.
+    env_->LowerThreadPoolCPUPriority(Env::Priority::BOTTOM, CpuPriority::kHigh);
+    RunTask(Env::Priority::BOTTOM);
+    ASSERT_EQ(from_priority, CpuPriority::kNormal);
+    ASSERT_EQ(to_priority, CpuPriority::kNormal);
+  }
+
+  {
+    // Lower priority from kNormal -> kLow.
+    env_->LowerThreadPoolCPUPriority(Env::Priority::BOTTOM, CpuPriority::kLow);
+    RunTask(Env::Priority::BOTTOM);
+    ASSERT_EQ(from_priority, CpuPriority::kNormal);
+    ASSERT_EQ(to_priority, CpuPriority::kLow);
+  }
+
+  {
+    // Lower priority from kLow -> kIdle.
+    env_->LowerThreadPoolCPUPriority(Env::Priority::BOTTOM, CpuPriority::kIdle);
+    RunTask(Env::Priority::BOTTOM);
+    ASSERT_EQ(from_priority, CpuPriority::kLow);
+    ASSERT_EQ(to_priority, CpuPriority::kIdle);
+  }
+
+  {
+    // Lower priority from kNormal -> kIdle for another pool.
+    env_->LowerThreadPoolCPUPriority(Env::Priority::HIGH, CpuPriority::kIdle);
+    RunTask(Env::Priority::HIGH);
+    ASSERT_EQ(from_priority, CpuPriority::kNormal);
+    ASSERT_EQ(to_priority, CpuPriority::kIdle);
+  }
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->ClearAllCallBacks();
+}
 #endif
 
 TEST_F(EnvPosixTest, MemoryMappedFileBuffer) {
@@ -325,6 +400,7 @@ TEST_P(EnvPosixTestWithParam, UnSchedule) {
 // run in any order. The purpose of the test is unclear.
 #ifndef OS_WIN
 TEST_P(EnvPosixTestWithParam, RunMany) {
+  env_->SetBackgroundThreads(1, Env::LOW);
   std::atomic<int> last_id(0);
 
   struct CB {
@@ -1240,7 +1316,7 @@ TEST_F(EnvPosixTest, MultiReadNonAlignedLargeNum) {
     for (int so: start_offsets) {
       offsets.push_back(so);
     }
-    for (size_t i = 0; i < offsets.size() - 1; i++) {
+    for (size_t i = 0; i + 1 < offsets.size(); i++) {
       lens.push_back(static_cast<size_t>(rnd.Uniform(static_cast<int>(offsets[i + 1] - offsets[i])) + 1));
     }
     lens.push_back(static_cast<size_t>(rnd.Uniform(static_cast<int>(kTotalSize - offsets.back())) + 1));
@@ -1272,7 +1348,7 @@ TEST_F(EnvPosixTest, MultiReadNonAlignedLargeNum) {
     ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->DisableProcessing();
   }
 }
-  
+
 // Only works in linux platforms
 #ifdef OS_WIN
 TEST_P(EnvPosixTestWithParam, DISABLED_InvalidateCache) {
@@ -1935,7 +2011,13 @@ class TestEnv : public EnvWrapper {
   int close_count;
 };
 
-class EnvTest : public testing::Test {};
+class EnvTest : public testing::Test {
+ public:
+  EnvTest() : test_directory_(test::PerThreadDBPath("env_test")) {}
+
+ protected:
+  const std::string test_directory_;
+};
 
 TEST_F(EnvTest, Close) {
   TestEnv* env = new TestEnv();
@@ -1979,6 +2061,139 @@ INSTANTIATE_TEST_CASE_P(
     ChrootEnvWithDirectIO, EnvPosixTestWithParam,
     ::testing::Values(std::pair<Env*, bool>(chroot_env.get(), true)));
 #endif  // !defined(ROCKSDB_LITE) && !defined(OS_WIN)
+
+class EnvFSTestWithParam
+    : public ::testing::Test,
+      public ::testing::WithParamInterface<std::tuple<bool, bool, bool>> {
+ public:
+  EnvFSTestWithParam() {
+    bool env_non_null = std::get<0>(GetParam());
+    bool env_default = std::get<1>(GetParam());
+    bool fs_default = std::get<2>(GetParam());
+
+    env_ = env_non_null ? (env_default ? Env::Default() : nullptr) : nullptr;
+    fs_ = fs_default
+              ? FileSystem::Default()
+              : std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+    if (env_non_null && env_default && !fs_default) {
+      env_ptr_ = NewCompositeEnv(fs_);
+    }
+    if (env_non_null && !env_default && fs_default) {
+      env_ptr_ = std::unique_ptr<Env>(new FaultInjectionTestEnv(Env::Default()));
+      fs_.reset();
+    }
+    if (env_non_null && !env_default && !fs_default) {
+      env_ptr_.reset(new FaultInjectionTestEnv(Env::Default()));
+      composite_env_ptr_.reset(new CompositeEnvWrapper(env_ptr_.get(), fs_));
+      env_ = composite_env_ptr_.get();
+    } else {
+      env_ = env_ptr_.get();
+    }
+
+    dbname1_ = test::PerThreadDBPath("env_fs_test1");
+    dbname2_ = test::PerThreadDBPath("env_fs_test2");
+  }
+
+  ~EnvFSTestWithParam() = default;
+
+  Env* env_;
+  std::unique_ptr<Env> env_ptr_;
+  std::unique_ptr<Env> composite_env_ptr_;
+  std::shared_ptr<FileSystem> fs_;
+  std::string dbname1_;
+  std::string dbname2_;
+};
+
+TEST_P(EnvFSTestWithParam, OptionsTest) {
+  Options opts;
+  opts.env = env_;
+  opts.create_if_missing = true;
+  std::string dbname = dbname1_;
+
+  if (env_) {
+    if (fs_) {
+      ASSERT_EQ(fs_.get(), env_->GetFileSystem().get());
+    } else {
+      ASSERT_NE(FileSystem::Default().get(), env_->GetFileSystem().get());
+    }
+  }
+  for (int i = 0; i < 2; ++i) {
+    DB* db;
+    Status s = DB::Open(opts, dbname, &db);
+    ASSERT_OK(s);
+
+    WriteOptions wo;
+    db->Put(wo, "a", "a");
+    db->Flush(FlushOptions());
+    db->Put(wo, "b", "b");
+    db->Flush(FlushOptions());
+    db->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+
+    std::string val;
+    ASSERT_OK(db->Get(ReadOptions(), "a", &val));
+    ASSERT_EQ("a", val);
+    ASSERT_OK(db->Get(ReadOptions(), "b", &val));
+    ASSERT_EQ("b", val);
+
+    db->Close();
+    delete db;
+    DestroyDB(dbname, opts);
+
+    dbname = dbname2_;
+  }
+}
+
+// The parameters are as follows -
+// 1. True means Options::env is non-null, false means null
+// 2. True means use Env::Default, false means custom
+// 3. True means use FileSystem::Default, false means custom
+INSTANTIATE_TEST_CASE_P(
+    EnvFSTest, EnvFSTestWithParam,
+    ::testing::Combine(::testing::Bool(), ::testing::Bool(),
+                       ::testing::Bool()));
+
+// This test ensures that default Env and those allocated by
+// NewCompositeEnv() all share the same threadpool
+TEST_F(EnvTest, MultipleCompositeEnv) {
+  std::shared_ptr<FaultInjectionTestFS> fs1 =
+    std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  std::shared_ptr<FaultInjectionTestFS> fs2 =
+    std::make_shared<FaultInjectionTestFS>(FileSystem::Default());
+  std::unique_ptr<Env> env1 = NewCompositeEnv(fs1);
+  std::unique_ptr<Env> env2 = NewCompositeEnv(fs2);
+  Env::Default()->SetBackgroundThreads(8, Env::HIGH);
+  Env::Default()->SetBackgroundThreads(16, Env::LOW);
+
+  ASSERT_EQ(env1->GetBackgroundThreads(Env::LOW), 16);
+  ASSERT_EQ(env1->GetBackgroundThreads(Env::HIGH), 8);
+  ASSERT_EQ(env2->GetBackgroundThreads(Env::LOW), 16);
+  ASSERT_EQ(env2->GetBackgroundThreads(Env::HIGH), 8);
+}
+
+TEST_F(EnvTest, IsDirectory) {
+  Status s = Env::Default()->CreateDirIfMissing(test_directory_);
+  ASSERT_OK(s);
+  const std::string test_sub_dir = test_directory_ + "sub1";
+  const std::string test_file_path = test_directory_ + "file1";
+  ASSERT_OK(Env::Default()->CreateDirIfMissing(test_sub_dir));
+  bool is_dir = false;
+  ASSERT_OK(Env::Default()->IsDirectory(test_sub_dir, &is_dir));
+  ASSERT_TRUE(is_dir);
+  {
+    std::unique_ptr<FSWritableFile> wfile;
+    s = Env::Default()->GetFileSystem()->NewWritableFile(
+        test_file_path, FileOptions(), &wfile, /*dbg=*/nullptr);
+    ASSERT_OK(s);
+    std::unique_ptr<WritableFileWriter> fwriter;
+    fwriter.reset(new WritableFileWriter(std::move(wfile), test_file_path,
+                                         FileOptions(), Env::Default()));
+    constexpr char buf[] = "test";
+    s = fwriter->Append(buf);
+    ASSERT_OK(s);
+  }
+  ASSERT_OK(Env::Default()->IsDirectory(test_file_path, &is_dir));
+  ASSERT_FALSE(is_dir);
+}
 
 }  // namespace ROCKSDB_NAMESPACE
 

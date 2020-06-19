@@ -96,6 +96,8 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   if (props.file_creation_time > 0) {
     Add(TablePropertiesNames::kFileCreationTime, props.file_creation_time);
   }
+  Add(TablePropertiesNames::kDbId, props.db_id);
+  Add(TablePropertiesNames::kDbSessionId, props.db_session_id);
 
   if (!props.filter_policy_name.empty()) {
     Add(TablePropertiesNames::kFilterPolicy, props.filter_policy_name);
@@ -311,6 +313,10 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
         continue;
       }
       *(pos->second) = val;
+    } else if (key == TablePropertiesNames::kDbId) {
+      new_table_properties->db_id = raw_val.ToString();
+    } else if (key == TablePropertiesNames::kDbSessionId) {
+      new_table_properties->db_session_id = raw_val.ToString();
     } else if (key == TablePropertiesNames::kFilterPolicy) {
       new_table_properties->filter_policy_name = raw_val.ToString();
     } else if (key == TablePropertiesNames::kColumnFamilyName) {
@@ -358,11 +364,12 @@ Status ReadTableProperties(RandomAccessFileReader* file, uint64_t file_size,
                            const ImmutableCFOptions& ioptions,
                            TableProperties** properties,
                            bool compression_type_missing,
-                           MemoryAllocator* memory_allocator) {
+                           MemoryAllocator* memory_allocator,
+                           FilePrefetchBuffer* prefetch_buffer) {
   // -- Read metaindex block
   Footer footer;
-  auto s = ReadFooterFromFile(file, nullptr /* prefetch_buffer */, file_size,
-                              &footer, table_magic_number);
+  auto s = ReadFooterFromFile(file, prefetch_buffer, file_size, &footer,
+                              table_magic_number);
   if (!s.ok()) {
     return s;
   }
@@ -374,8 +381,8 @@ Status ReadTableProperties(RandomAccessFileReader* file, uint64_t file_size,
   PersistentCacheOptions cache_options;
 
   BlockFetcher block_fetcher(
-      file, nullptr /* prefetch_buffer */, footer, read_options,
-      metaindex_handle, &metaindex_contents, ioptions, false /* decompress */,
+      file, prefetch_buffer, footer, read_options, metaindex_handle,
+      &metaindex_contents, ioptions, false /* decompress */,
       false /*maybe_compressed*/, BlockType::kMetaIndex,
       UncompressionDict::GetEmptyDict(), cache_options, memory_allocator);
   s = block_fetcher.ReadBlockContents();
@@ -398,11 +405,11 @@ Status ReadTableProperties(RandomAccessFileReader* file, uint64_t file_size,
 
   TableProperties table_properties;
   if (found_properties_block == true) {
-    s = ReadProperties(
-        meta_iter->value(), file, nullptr /* prefetch_buffer */, footer,
-        ioptions, properties, false /* verify_checksum */,
-        nullptr /* ret_block_hanel */, nullptr /* ret_block_contents */,
-        compression_type_missing, memory_allocator);
+    s = ReadProperties(meta_iter->value(), file, prefetch_buffer, footer,
+                       ioptions, properties, false /* verify_checksum */,
+                       nullptr /* ret_block_hanel */,
+                       nullptr /* ret_block_contents */,
+                       compression_type_missing, memory_allocator);
   } else {
     s = Status::NotFound();
   }
