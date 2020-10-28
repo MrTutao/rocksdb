@@ -11,11 +11,14 @@
 #include <vector>
 
 #include "db/db_test_util.h"
+#include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/db.h"
 #include "rocksdb/utilities/table_properties_collectors.h"
+#include "table/format.h"
 #include "test_util/testharness.h"
 #include "test_util/testutil.h"
+#include "util/random.h"
 
 #ifndef ROCKSDB_LITE
 
@@ -48,7 +51,8 @@ void VerifyTableProperties(DB* db, uint64_t expected_entries_size) {
 class DBTablePropertiesTest : public DBTestBase,
                               public testing::WithParamInterface<std::string> {
  public:
-  DBTablePropertiesTest() : DBTestBase("/db_table_properties_test") {}
+  DBTablePropertiesTest()
+      : DBTestBase("/db_table_properties_test", /*env_do_fsync=*/true) {}
   TablePropertiesCollection TestGetPropertiesOfTablesInRange(
       std::vector<Range> ranges, std::size_t* num_properties = nullptr,
       std::size_t* num_files = nullptr);
@@ -155,12 +159,12 @@ TEST_F(DBTablePropertiesTest, GetPropertiesOfTablesInRange) {
 
   // build a decent LSM
   for (int i = 0; i < 10000; i++) {
-    ASSERT_OK(Put(test::RandomKey(&rnd, 5), RandomString(&rnd, 102)));
+    ASSERT_OK(Put(test::RandomKey(&rnd, 5), rnd.RandomString(102)));
   }
   Flush();
   dbfull()->TEST_WaitForCompact();
   if (NumTableFilesAtLevel(0) == 0) {
-    ASSERT_OK(Put(test::RandomKey(&rnd, 5), RandomString(&rnd, 102)));
+    ASSERT_OK(Put(test::RandomKey(&rnd, 5), rnd.RandomString(102)));
     Flush();
   }
 
@@ -272,6 +276,55 @@ TEST_F(DBTablePropertiesTest, GetDbIdentifiersProperty) {
   }
 }
 
+class DBTableHostnamePropertyTest
+    : public DBTestBase,
+      public ::testing::WithParamInterface<std::tuple<int, std::string>> {
+ public:
+  DBTableHostnamePropertyTest()
+      : DBTestBase("/db_table_hostname_property_test",
+                   /*env_do_fsync=*/false) {}
+};
+
+TEST_P(DBTableHostnamePropertyTest, DbHostLocationProperty) {
+  option_config_ = std::get<0>(GetParam());
+  Options opts = CurrentOptions();
+  std::string expected_host_id = std::get<1>(GetParam());
+  ;
+  if (expected_host_id == kHostnameForDbHostId) {
+    ASSERT_OK(env_->GetHostNameString(&expected_host_id));
+  } else {
+    opts.db_host_id = expected_host_id;
+  }
+  CreateAndReopenWithCF({"goku"}, opts);
+
+  for (uint32_t cf = 0; cf < 2; ++cf) {
+    Put(cf, "key", "val");
+    Put(cf, "foo", "bar");
+    Flush(cf);
+
+    TablePropertiesCollection fname_to_props;
+    ASSERT_OK(db_->GetPropertiesOfAllTables(handles_[cf], &fname_to_props));
+    ASSERT_EQ(1U, fname_to_props.size());
+
+    ASSERT_EQ(fname_to_props.begin()->second->db_host_id, expected_host_id);
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(
+    DBTableHostnamePropertyTest, DBTableHostnamePropertyTest,
+    ::testing::Values(
+        // OptionConfig, override db_host_location
+        std::make_tuple(DBTestBase::OptionConfig::kDefault,
+                        kHostnameForDbHostId),
+        std::make_tuple(DBTestBase::OptionConfig::kDefault, "foobar"),
+        std::make_tuple(DBTestBase::OptionConfig::kDefault, ""),
+        std::make_tuple(DBTestBase::OptionConfig::kPlainTableFirstBytePrefix,
+                        kHostnameForDbHostId),
+        std::make_tuple(DBTestBase::OptionConfig::kPlainTableFirstBytePrefix,
+                        "foobar"),
+        std::make_tuple(DBTestBase::OptionConfig::kPlainTableFirstBytePrefix,
+                        "")));
+
 class DeletionTriggeredCompactionTestListener : public EventListener {
  public:
   void OnCompactionBegin(DB* , const CompactionJobInfo& ci) override {
@@ -293,6 +346,7 @@ TEST_P(DBTablePropertiesTest, DeletionTriggeredCompactionMarking) {
     NewCompactOnDeletionCollectorFactory(kWindowSize, kNumDelsTrigger);
 
   Options opts = CurrentOptions();
+  opts.statistics = ROCKSDB_NAMESPACE::CreateDBStatistics();
   opts.table_properties_collector_factories.emplace_back(compact_on_del);
 
   if(GetParam() == "kCompactionStyleUniversal") {
@@ -363,6 +417,8 @@ TEST_P(DBTablePropertiesTest, DeletionTriggeredCompactionMarking) {
 
   dbfull()->TEST_WaitForCompact();
   ASSERT_EQ(1, NumTableFilesAtLevel(0));
+  ASSERT_LT(0, opts.statistics->getTickerCount(COMPACT_WRITE_BYTES_MARKED));
+  ASSERT_LT(0, opts.statistics->getTickerCount(COMPACT_READ_BYTES_MARKED));
 }
 
 INSTANTIATE_TEST_CASE_P(

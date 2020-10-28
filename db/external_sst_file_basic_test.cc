@@ -10,8 +10,9 @@
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/sst_file_writer.h"
-#include "test_util/fault_injection_test_env.h"
 #include "test_util/testutil.h"
+#include "util/random.h"
+#include "utilities/fault_injection_env.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -20,14 +21,15 @@ class ExternalSSTFileBasicTest
     : public DBTestBase,
       public ::testing::WithParamInterface<std::tuple<bool, bool>> {
  public:
-  ExternalSSTFileBasicTest() : DBTestBase("/external_sst_file_basic_test") {
+  ExternalSSTFileBasicTest()
+      : DBTestBase("/external_sst_file_basic_test", /*env_do_fsync=*/true) {
     sst_files_dir_ = dbname_ + "/sst_files/";
-    fault_injection_test_env_.reset(new FaultInjectionTestEnv(Env::Default()));
+    fault_injection_test_env_.reset(new FaultInjectionTestEnv(env_));
     DestroyAndRecreateExternalSSTFilesDir();
   }
 
   void DestroyAndRecreateExternalSSTFilesDir() {
-    test::DestroyDir(env_, sst_files_dir_);
+    DestroyDir(env_, sst_files_dir_);
     env_->CreateDir(sst_files_dir_);
   }
 
@@ -160,9 +162,7 @@ class ExternalSSTFileBasicTest
         write_global_seqno, verify_checksums_before_ingest, true_data);
   }
 
-  ~ExternalSSTFileBasicTest() override {
-    test::DestroyDir(env_, sst_files_dir_);
-  }
+  ~ExternalSSTFileBasicTest() override { DestroyDir(env_, sst_files_dir_); }
 
  protected:
   std::string sst_files_dir_;
@@ -1109,6 +1109,7 @@ TEST_F(ExternalSSTFileBasicTest, SyncFailure) {
     }
 
     Options sst_file_writer_options;
+    sst_file_writer_options.env = env_;
     std::unique_ptr<SstFileWriter> sst_file_writer(
         new SstFileWriter(EnvOptions(), sst_file_writer_options));
     std::string file_name =
@@ -1137,17 +1138,18 @@ TEST_F(ExternalSSTFileBasicTest, SyncFailure) {
 TEST_F(ExternalSSTFileBasicTest, VerifyChecksumReadahead) {
   Options options;
   options.create_if_missing = true;
-  SpecialEnv senv(Env::Default());
+  SpecialEnv senv(env_);
   options.env = &senv;
   DestroyAndReopen(options);
 
   Options sst_file_writer_options;
+  sst_file_writer_options.env = env_;
   std::unique_ptr<SstFileWriter> sst_file_writer(
       new SstFileWriter(EnvOptions(), sst_file_writer_options));
   std::string file_name = sst_files_dir_ + "verify_checksum_readahead_test.sst";
   ASSERT_OK(sst_file_writer->Open(file_name));
   Random rnd(301);
-  std::string value = DBTestBase::RandomString(&rnd, 4000);
+  std::string value = rnd.RandomString(4000);
   for (int i = 0; i < 5000; i++) {
     ASSERT_OK(sst_file_writer->Put(DBTestBase::Key(i), value));
   }
